@@ -42,6 +42,12 @@ Run from a vLLM source checkout after installing the plugin:
 PYTHONPATH="$PWD:/path/to/plugin/tests" pytest -q -p tests.conftest /path/to/plugin/tests
 ```
 
+## Usage
+
+The checkpoint's default context length does not fit on one B70; set
+`--max-model-len` to fit your KV cache. `-cc.mode=none` disables `torch.compile`;
+full decode graphs still work.
+
 ```bash
 vllm serve thinkingmachines/Inkling-2-Mini \
   --language-model-only \
@@ -68,13 +74,37 @@ Single-device, text-only inference. Activations are BF16; expert weights use
 NVFP4 or MXFP8, following vLLM's Hopper path. Tensor/expert parallelism, LoRA,
 and `torch.compile` are not supported.
 
-Development-tier measurements on one Arc Pro B70 with vLLM PR #69186: 57.7
-tok/s decode; 75.8 tok/s with DSpark k=7 and mean acceptance length 2.99; about
-3,250 tok/s prefill for a 2,000-token prompt. Without #69186, decode is about
-7.5 ms/token slower than these headline numbers.
+Development-tier measurements on one Arc Pro B70 (single stream, greedy, 6 coding
+and reasoning chat prompts, 256 output tokens), with vLLM PR #69186 applied:
+57.2 tok/s decode; 75.9 tok/s with DSpark k=7 at mean acceptance length 2.99;
+about 3,250 tok/s prefill for a 2,000-token prompt. Without #69186 (fp32 lm_head
+fast path on XPU), decode is about 7.5 ms/token slower. DSpark gains depend on
+the workload: on short chat prompts with reasoning disabled, acceptance length
+was 2.02 and DSpark was slower than no speculation.
 
-## TODO — Numerical parity
+With DSpark enabled, greedy output can differ from greedy output without it.
+Verification runs several tokens through the batched expert kernel instead of
+the single-token kernel, so rounding differs and near-tied tokens can flip; in
+the cases we checked, the top-two log-probabilities at the first divergence were
+0.025 to 0.068 apart.
 
-Numerical-parity results are being produced separately.
+## Numerical parity
 
+Compared against an independent reference: Hugging Face Transformers Inkling 2
+on CPU, experts dequantized from the same checkpoint to fp32, BF16 activations
+(matching the XPU semantics). Teacher-forced next-token log-probabilities on 4
+short prompts and the first 2,048 positions of 2 long prompts (4,174 positions):
+
+| vs CPU fp32 | top-1 agreement | median / p95 / max abs Δ logprob |
+|---|---|---|
+| XPU | 99.4% | 0.00017 / 0.024 / 5.69 |
+| CPU bf16 (noise floor) | 99.4% | 0.00017 / 0.029 / 5.63 |
+
+Short prompts individually agree 96.2–100% on top-1 tokens. A 64-token greedy chat
+continuation matched the CPU fp32 reference exactly. The largest single layer
+difference found was a router near-tie (8th vs 9th expert scores 6e-5 apart).
+The XPU side was an earlier in-tree build of the same kernels (vLLM branch commit
+`32ecd66097`); later builds and this plugin produced token-identical greedy output
+on the validation prompts. This is bounded evidence on sampled sequences, not a
+bitwise or general guarantee.
 This project is not affiliated with vLLM, Intel, or Thinking Machines.
