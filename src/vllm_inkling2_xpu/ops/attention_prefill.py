@@ -22,6 +22,8 @@ def _rel_attention(
     softmax_scale,
     num_tokens,
     num_kv_rows,
+    k_lo_tok,
+    k_hi_tok,
     stride_bt,
     stride_out_t,
     stride_out_h,
@@ -51,14 +53,15 @@ def _rel_attention(
     if t0 >= q_len:
         return
     seqlen_k = tl.load(SeqLens + req)
+    k_limit = tl.where(k_hi_tok < 0, seqlen_k, tl.minimum(seqlen_k, k_hi_tok))
     past = seqlen_k - q_len
     tok = t0 + tl.arange(0, BLOCK_M)
     pos = past + tok
     pos_hi = past + tl.minimum(t0 + BLOCK_M, q_len) - 1
-    n_lo = 0
+    n_lo = k_lo_tok // BLOCK_N
     if WINDOW > 0:
-        n_lo = tl.maximum(past + t0 - (WINDOW - 1), 0) // BLOCK_N
-    n_hi = (pos_hi + BLOCK_N) // BLOCK_N
+        n_lo = tl.maximum(n_lo, tl.maximum(past + t0 - (WINDOW - 1), 0) // BLOCK_N)
+    n_hi = (tl.minimum(pos_hi + 1, k_limit) + BLOCK_N - 1) // BLOCK_N
 
     qd = tl.make_tensor_descriptor(Q, [num_tokens, H * D], [H * D, 1], [BLOCK_M, D])
     kvd = tl.make_tensor_descriptor(KV, [num_kv_rows, KV_W], [KV_W, 1], [BLOCK_N, D])
@@ -81,10 +84,10 @@ def _rel_attention(
         page = tl.load(bt + k0 // PAGE)
         row = page * ROWS_PER_BLOCK + kv_head * HEAD_ROWS + k0 % PAGE
         col = kv_head * HEAD_COLS
-        k = kvd.load([row, col])
+        k = kvd.load([row, col]).to(q.dtype)
         scores = tl.dot(q, tl.trans(k)) * (softmax_scale * LOG2E)
         dist = pos[:, None] - keys[None, :]
-        visible = (dist >= 0) & (keys[None, :] < seqlen_k)
+        visible = (dist >= 0) & (keys[None, :] < k_limit)
         if WINDOW > 0:
             visible &= dist < WINDOW
         bias = reld.load([q_start + t0, rel_col + k0])
@@ -95,12 +98,14 @@ def _rel_attention(
         alpha = tl.exp2(m_i - m_safe)
         p = tl.exp2(scores - m_safe[:, None])
         l_i = l_i * alpha + tl.sum(p, 1)
-        v = kvd.load([row, col + D])
-        acc = acc * alpha[:, None] + tl.dot(p.to(v.dtype), v)
+        v = kvd.load([row, col + D]).to(q.dtype)
+        acc = acc * alpha[:, None] + tl.dot(p.to(q.dtype), v)
         m_i = m_new
 
-    o = acc / l_i[:, None]
-    lse = (m_i + tl.log2(l_i)) * 0.6931471805599453
+    empty = l_i == 0.0
+    l_safe = tl.where(empty, 1.0, l_i)
+    o = tl.where(empty[:, None], 0.0, acc / l_safe[:, None])
+    lse = tl.where(empty, float("-inf"), (m_i + tl.log2(l_safe)) * 0.6931471805599453)
     token = (q_start + tok).to(tl.int64)
     offs_d = tl.arange(0, D)
     tl.store(
@@ -145,22 +150,39 @@ def rel_attention(
     window: int,
     num_splits: int,
     mode: int,
+    k_lo_tok: int = 0,
+    k_hi_tok: int = -1,
 ) -> None:
-    """Write the prefill attention output and natural-log LSE."""
+    """Write the prefill attention output and natural-log LSE.
+
+    Optional ``k_lo_tok`` (inclusive, ``BLOCK_N``-aligned) and ``k_hi_tok``
+    (exclusive, ``< 0`` for unbounded) restrict the key range on the 2D-block-load
+    fast path so callers can chunk long KV caches and merge via LSE.
+    """
     tokens, heads, head_dim = q.shape
     blocks, page, kv_heads, _ = key_cache.shape
     bm, bn = 64, 16
+    if k_lo_tok < 0 or k_lo_tok % bn:
+        raise ValueError(
+            f"k_lo_tok ({k_lo_tok}) must be non-negative and divisible by {bn}."
+        )
     layout = _kv_layout(key_cache, value_cache)
     if (
         layout is None
         or page % bn
         or num_splits != 1
         or mode != attention_triton.MODE_OUT_LSE
-        or any(
-            t.dtype != torch.bfloat16 for t in (q, key_cache, value_cache, rel_logits)
-        )
+        or q.dtype != torch.bfloat16
+        or rel_logits.dtype != torch.bfloat16
+        or key_cache.dtype not in (torch.bfloat16, torch.float8_e4m3fn)
+        or value_cache.dtype != key_cache.dtype
         or not (q.is_contiguous() and rel_logits.is_contiguous())
     ):
+        if k_lo_tok != 0 or k_hi_tok >= 0:
+            raise ValueError(
+                "Bounded prefill attention (k_lo_tok/k_hi_tok) requires the "
+                "2D-block-load fast path (contiguous bf16 q/rel, block_size % 16 == 0)."
+            )
         attention_triton.rel_attention(
             q,
             key_cache,
@@ -192,6 +214,8 @@ def rel_attention(
         softmax_scale,
         tokens,
         blocks * rows_per_block,
+        k_lo_tok,
+        k_hi_tok,
         block_table.stride(0),
         out.stride(0),
         out.stride(1),
