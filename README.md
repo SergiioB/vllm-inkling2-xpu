@@ -33,7 +33,8 @@ with the Intel GPU driver installed (`ls /dev/dri/renderD*` lists your GPUs).
 **1. Build vLLM's XPU image from `main`.** No published vLLM release or
 `vllm/vllm-openai-xpu` nightly built before 2026-11-22 contains Inkling 2. Once a
 nightly includes [#69028](https://github.com/vllm-project/vllm/pull/69028), you can
-skip this step and use `BASE=vllm/vllm-openai-xpu:nightly` in step 2.
+skip this step and use `BASE=vllm/vllm-openai-xpu:nightly` in step 2. A cold build
+took about 17 minutes on a 72-core host.
 
 ```bash
 git clone https://github.com/vllm-project/vllm.git
@@ -53,7 +54,8 @@ git clone https://github.com/mgaruccio/vllm-inkling2-xpu.git
 docker build --build-arg BASE=vllm-xpu:main -t vllm-xpu:inkling2 vllm-inkling2-xpu
 ```
 
-**3. Download the checkpoint** (optional; `vllm serve` downloads it otherwise).
+**3. Download the checkpoint** (~20 GB; optional, `vllm serve` downloads it
+otherwise). Files the container writes into `~/.cache/huggingface` are owned by root.
 
 ```bash
 mkdir -p ~/.cache/huggingface
@@ -76,20 +78,27 @@ docker run -d --name inkling2 \
   -cc.mode=none -cc.cudagraph_mode=FULL_DECODE_ONLY \
   --reasoning-parser inkling --enable-auto-tool-choice --tool-call-parser inkling \
   --speculative-config '{"method":"dspark","num_speculative_tokens":7}'
-docker logs -f inkling2   # ready when "Application startup complete" appears
+docker logs -f inkling2   # ready when "Application startup complete" appears (~2 min)
 ```
 
 Drop the `--speculative-config` line to run without speculative decoding.
 
-**5. Send a request.**
+**5. Send a request.** Inkling 2 reasons before it answers. The `inkling` reasoning
+parser returns the reasoning in `message.reasoning` and the answer in
+`message.content`. Leave room for both: if `max_tokens` runs out while the model is
+still reasoning, `content` is `null` and `finish_reason` is `length`.
+`reasoning_effort` shortens the reasoning.
 
 ```bash
 curl -s localhost:8000/v1/chat/completions -H 'Content-Type: application/json' -d '{
   "model": "thinkingmachines/Inkling-2-Mini",
   "messages": [{"role": "user", "content": "Write a haiku about Intel GPUs."}],
-  "max_tokens": 512
-}' | python3 -m json.tool
+  "max_tokens": 2048,
+  "reasoning_effort": "low"
+}' | python3 -c 'import json, sys; print(json.load(sys.stdin)["choices"][0]["message"]["content"])'
 ```
+
+This returned a haiku in about 9 seconds (553 tokens, most of them reasoning).
 
 ## Install into an existing environment
 
