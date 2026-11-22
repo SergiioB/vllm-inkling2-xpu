@@ -28,6 +28,8 @@ include = ["vllm_inkling2_xpu*"]
 
 [tool.ruff]
 line-length = 88
+# results/ holds the exact scripts that produced the published numbers.
+extend-exclude = ["results"]
 target-version = "py310"
 
 [tool.ruff.lint]
