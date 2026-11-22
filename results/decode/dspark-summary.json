@@ -1,0 +1,21 @@
+{
+  "tier": "development",
+  "depth": 0,
+  "tokens": 256,
+  "median_decode_tok_s": 75.94388020177928,
+  "median_ttft_s": 0.09522458299761638,
+  "per_case": [
+    75.62,
+    70.74,
+    77.27,
+    53.59,
+    102.95,
+    76.27
+  ],
+  "spec": {
+    "num_drafts": 516.0,
+    "num_draft_tokens": 3612.0,
+    "num_accepted_tokens": 1026.0
+  },
+  "mean_acceptance_length": 2.988372093023256
+}
