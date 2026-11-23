@@ -46,6 +46,60 @@ from .ops.linear import linear
 from .ops.sconv import attention_prologue, shift_rel_proj
 from .sconv import K_STREAM, V_STREAM, Inkling2ShortConv, conv_metadata
 
+# Reusable <= 256 MiB BF16 scratch per (device, page shape), intentionally
+# retained for process lifetime to avoid XPU allocator fragmentation across
+# chunked-prefill steps.
+_FP8_PREFILL_SCRATCH: dict[tuple[torch.device, int, int, int], torch.Tensor] = {}
+_FP8_PREFILL_SCRATCH_MAX_BYTES = 256 * 1024 * 1024
+
+
+def _fp8_prefill_scratch(
+    device: torch.device,
+    num_kv_heads: int,
+    block_size: int,
+    kv_width: int,
+) -> torch.Tensor | None:
+    """Return the shared BF16 prefill scratch for this page shape.
+
+    The buffer is allocated once per ``(device, num_kv_heads, block_size,
+    kv_width)`` so every layer using that page shape shares a single
+    <= 256 MiB buffer. Returns ``None`` where the 2D-block-load fast path
+    cannot run (``block_size % 16 != 0``) or a single page already exceeds
+    the scratch budget.
+    """
+    if block_size % 16 or device.type == "meta":
+        return None
+    page_bf16_bytes = num_kv_heads * block_size * kv_width * 2
+    max_pages = _FP8_PREFILL_SCRATCH_MAX_BYTES // page_bf16_bytes
+    if not max_pages:
+        return None
+    buf_key = (device, num_kv_heads, block_size, kv_width)
+    buf = _FP8_PREFILL_SCRATCH.get(buf_key)
+    if buf is None:
+        buf = torch.empty(
+            (max_pages, num_kv_heads, block_size, kv_width),
+            dtype=torch.bfloat16,
+            device=device,
+        )
+        _FP8_PREFILL_SCRATCH[buf_key] = buf
+    return buf
+
+
+def _single_prefill_seq_len(
+    common_attn_metadata: CommonAttentionMetadata,
+    num_decode_reqs: int,
+    num_prefill_reqs: int,
+) -> int | None:
+    """Exact sequence length of a sole prefill request from CPU metadata.
+
+    ``seq_lens_cpu_upper_bound`` is precise for prefill rows, so reading the
+    first (and only) prefill row needs no device sync.
+    """
+    seq_lens_cpu = common_attn_metadata.seq_lens_cpu_upper_bound
+    if num_prefill_reqs != 1 or seq_lens_cpu is None:
+        return None
+    return int(seq_lens_cpu[num_decode_reqs].item())
+
 
 class Inkling2AttentionMetadataBuilder(FlashAttentionMetadataBuilder):
     """Record leading decode/verify requests for mixed batches."""
@@ -69,6 +123,9 @@ class Inkling2AttentionMetadataBuilder(FlashAttentionMetadataBuilder):
             md.num_prefill_tokens,
         ) = split_decodes_and_prefills(
             common_attn_metadata, decode_threshold=self.reorder_batch_threshold
+        )
+        md.single_prefill_seq_len = _single_prefill_seq_len(
+            common_attn_metadata, md.num_decode_reqs, md.num_prefill_reqs
         )
         return md
 
@@ -242,14 +299,24 @@ class Inkling2Attention(nn.Module, AttentionLayerBase):
         vllm_config = get_current_vllm_config()
         self.max_decode_query_len = max_decode_query_len(vllm_config)
         cache_dtype = vllm_config.cache_config.cache_dtype
-        supported: tuple[str, ...] = ("auto", "bfloat16")
+        supported: tuple[str, ...] = ("auto", "bfloat16", "fp8", "fp8_e4m3")
         if cache_dtype not in supported:
             raise ValueError(f"Inkling2 KV cache dtype must be one of {supported}")
+        self.fp8_kv = cache_dtype in ("fp8", "fp8_e4m3")
         self.kv_cache = torch.tensor([])
         forward_context = vllm_config.compilation_config.static_forward_context
         if prefix in forward_context:
             raise ValueError(f"Duplicate layer name: {prefix}")
         forward_context[prefix] = self
+        if self.fp8_kv:
+            # Reserve the shared BF16 prefill scratch during model load so
+            # startup profiling counts it before KV cache sizing.
+            _fp8_prefill_scratch(
+                self.rel_logits_proj.device,
+                self.num_kv_heads,
+                vllm_config.cache_config.block_size,
+                2 * self.head_dim,
+            )
 
     def process_weights_after_loading(self) -> None:
         self.rel_proj_shifted = shift_rel_proj(self.rel_logits_proj, self.is_local)
@@ -289,6 +356,9 @@ class Inkling2Attention(nn.Module, AttentionLayerBase):
     def _split_kv_cache(
         self, kv_cache: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        if self.fp8_kv:
+            # Every loop pass owns byte storage containing unit-scale E4M3 KV.
+            kv_cache = kv_cache.view(torch.float8_e4m3fn)
         key_cache, value_cache = kv_cache.transpose(1, 2).split(self.head_dim, dim=-1)
         return (
             canonicalize_singleton_dim_strides(key_cache),
@@ -520,7 +590,106 @@ class Inkling2Attention(nn.Module, AttentionLayerBase):
         cu_seqlens_q = md.query_start_loc[num_decodes:]
         if num_decodes:
             cu_seqlens_q = cu_seqlens_q - num_decode_tokens
-        key_cache, value_cache = self._split_kv_cache(kv_cache)
+        block_table = md.block_table[num_decodes:]
+        cache_seqlens = md.seq_lens[num_decodes:]
+        if (
+            self.fp8_kv
+            and block_table.shape[0] == 1
+            and kv_cache.ndim == 4
+            and kv_cache.shape[2] % 16 == 0
+        ):
+            page = kv_cache.shape[2]
+            seq_len = getattr(md, "single_prefill_seq_len", None)
+            if seq_len is None:
+                seq_len = int(cache_seqlens[0].item())
+            end_page = (seq_len + page - 1) // page
+            if self.is_local:
+                first_tok = max(0, seq_len - md.max_query_len - self.sliding_window)
+                start_page = first_tok // page
+            else:
+                start_page = 0
+            n_active = end_page - start_page
+            # Materialize active FP8 pages into the shared <= 256 MiB BF16
+            # scratch (reserved at model load) so attention_prefill uses
+            # native 16-bit 2D block loads; above the budget, iterate in
+            # chunks and merge via FP32 online FlashAttention LSE.
+            buf = _fp8_prefill_scratch(
+                q.device, kv_cache.shape[1], kv_cache.shape[2], kv_cache.shape[3]
+            )
+            max_pages = buf.shape[0] if buf is not None else 0
+            if 0 < n_active and max_pages and end_page <= block_table.shape[1]:
+                kv_fp8 = kv_cache.view(torch.float8_e4m3fn)
+
+                def _run_chunk(
+                    p_lo: int, p_hi: int, o_dst: torch.Tensor, l_dst: torch.Tensor
+                ) -> None:
+                    cnt = p_hi - p_lo
+                    active = block_table[0, p_lo:p_hi].to(torch.int64)
+                    kv_bf16 = buf[:cnt]
+                    for s in range(0, cnt, 128):
+                        e = min(s + 128, cnt)
+                        kv_bf16[s:e].copy_(kv_fp8.index_select(0, active[s:e]))
+                    kc, vc = kv_bf16.transpose(1, 2).split(self.head_dim, dim=-1)
+                    remapped = torch.zeros(
+                        (1, p_hi), dtype=torch.int32, device=q.device
+                    )
+                    remapped[0, p_lo:p_hi] = torch.arange(
+                        cnt, dtype=torch.int32, device=q.device
+                    )
+                    rel_attention(
+                        q[:nt],
+                        kc,
+                        vc,
+                        o_dst,
+                        l_dst,
+                        rel_logits,
+                        block_table=remapped,
+                        cache_seqlens=cache_seqlens,
+                        cu_seqlens_q=cu_seqlens_q,
+                        max_query_len=md.max_query_len,
+                        softmax_scale=self.scaling,
+                        window=self.sliding_window if self.is_local else 0,
+                        num_splits=1,
+                        mode=MODE_OUT_LSE,
+                        k_lo_tok=p_lo * page,
+                        k_hi_tok=p_hi * page,
+                    )
+
+                if n_active <= max_pages:
+                    _run_chunk(start_page, end_page, out, lse)
+                else:
+                    o_tmp = torch.empty_like(out)
+                    l_tmp = torch.empty_like(lse)
+                    first = True
+                    for p_lo in range(start_page, end_page, max_pages):
+                        p_hi = min(p_lo + max_pages, end_page)
+                        if first:
+                            _run_chunk(p_lo, p_hi, out, lse)
+                            first = False
+                        else:
+                            _run_chunk(p_lo, p_hi, o_tmp, l_tmp)
+                            l0 = lse[:, :nt]
+                            l1 = l_tmp[:, :nt]
+                            m = torch.maximum(l0, l1)
+                            m_safe = torch.where(torch.isinf(m), torch.zeros_like(m), m)
+                            w0 = torch.exp(l0 - m_safe)
+                            w1 = torch.exp(l1 - m_safe)
+                            ws = w0 + w1
+                            ws_safe = torch.where(ws == 0, torch.ones_like(ws), ws)
+                            lse[:, :nt] = torch.where(
+                                ws == 0,
+                                torch.full_like(m, float("-inf")),
+                                m_safe + torch.log(ws_safe),
+                            )
+                            out[:nt] = out[:nt] * (w0 / ws_safe).t().unsqueeze(
+                                -1
+                            ) + o_tmp[:nt] * (w1 / ws_safe).t().unsqueeze(-1)
+                out[nt:].zero_()
+                lse[:, nt:].zero_()
+                return
+            key_cache, value_cache = self._split_kv_cache(kv_cache)
+        else:
+            key_cache, value_cache = self._split_kv_cache(kv_cache)
         rel_attention(
             q[:nt],
             key_cache,
@@ -528,8 +697,8 @@ class Inkling2Attention(nn.Module, AttentionLayerBase):
             out,
             lse,
             rel_logits,
-            block_table=md.block_table[num_decodes:],
-            cache_seqlens=md.seq_lens[num_decodes:],
+            block_table=block_table,
+            cache_seqlens=cache_seqlens,
             cu_seqlens_q=cu_seqlens_q,
             max_query_len=md.max_query_len,
             softmax_scale=self.scaling,

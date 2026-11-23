@@ -161,7 +161,10 @@ class Inkling2DraftSelfAttention(nn.Module):
                 v.view(-1, self.num_kv_heads, self.head_dim),
                 md.slot_mapping[: q.shape[0]],
             )
-            key_cache, value_cache = self.attn.kv_cache.transpose(1, 2).split(
+            kv_cache = self.attn.kv_cache
+            if kv_cache.dtype == torch.uint8:
+                kv_cache = kv_cache.view(torch.float8_e4m3fn)
+            key_cache, value_cache = kv_cache.transpose(1, 2).split(
                 self.head_dim, dim=-1
             )
             num_reqs = min(q.shape[0] // self.block, md.seq_lens.shape[0])
