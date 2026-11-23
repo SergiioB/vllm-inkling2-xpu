@@ -6,9 +6,9 @@ Intel Arc Pro B70 with [vLLM](https://github.com/vllm-project/vllm).
 vLLM supports Inkling 2 Mini on NVIDIA GPUs only. This is an out-of-tree
 [vLLM plugin](https://docs.vllm.ai/en/latest/design/plugin_system/) that adds
 Intel XPU support: Triton kernels for the NVFP4/MXFP8 experts and attention, full
-decode graphs, and DSpark speculative decoding with the bundled drafter. It
-registers itself through vLLM's `vllm.general_plugins` entry point and does not
-patch vLLM.
+decode graphs, image inputs, and DSpark speculative decoding with the bundled
+drafter. It registers itself through vLLM's `vllm.general_plugins` entry point
+and does not patch vLLM.
 
 Not affiliated with vLLM, Intel, or Thinking Machines.
 
@@ -100,6 +100,28 @@ curl -s localhost:8000/v1/chat/completions -H 'Content-Type: application/json' -
 
 This returned a haiku in about 9 seconds (553 tokens, most of them reasoning).
 
+### Try an image request
+
+Rebuild the plugin image from current `main` if it predates vision support, then
+recreate the server from step 4 **without `--language-model-only`**. The vision
+encoder uses additional GPU memory; if the KV cache is too small at startup,
+lower `--max-model-len`.
+
+```bash
+curl -fsS http://localhost:8000/v1/chat/completions \
+  -H 'Content-Type: application/json' -d '{
+  "model": "thinkingmachines/Inkling-2-Mini",
+  "messages": [{"role": "user", "content": [
+    {"type": "image_url", "image_url": {"url": "https://vllm-public-assets.s3.us-west-2.amazonaws.com/multimodal_asset/stop_sign.jpg"}},
+    {"type": "text", "text": "What word is written on the sign?"}
+  ]}],
+  "max_tokens": 2048,
+  "reasoning_effort": "low"
+}' | python3 -c 'import json, sys; print(json.load(sys.stdin)["choices"][0]["message"]["content"])'
+```
+
+The expected answer is `STOP`.
+
 ## Install into an existing environment
 
 Any XPU build of vLLM main at or after `c32251b5d1` works:
@@ -119,7 +141,7 @@ from vllm.platforms.xpu import XPUPlatform as p; print('inkling2' in p.supported
 
 | Flag | Why |
 |---|---|
-| `--language-model-only` | Text only; image inputs are not supported on XPU. |
+| `--language-model-only` | Optional: disable the vision encoder for text-only serving and save GPU memory. Omit it to accept images. |
 | `--dtype bfloat16` | BF16 activations (experts stay NVFP4/MXFP8). |
 | `--max-model-len 8192` | The default context length does not fit on one B70. Raise it as far as your KV cache allows; the server log reports the KV cache size. |
 | `-cc.mode=none` | `torch.compile` is not supported for this model on XPU. |
@@ -203,7 +225,7 @@ bitwise or general guarantee. Details: [`results/parity.md`](results/parity.md).
 ## Limitations
 
 - One device: tensor and expert parallelism raise an error at startup.
-- Text only, BF16, no LoRA, no `torch.compile`.
+- BF16 activations, no LoRA, no `torch.compile`.
 - Expert activations stay BF16 (W4A16/W8A16), like vLLM's Hopper path; the
   checkpoint's NVFP4/MXFP8 activation quantization is not applied.
 - Validated with one sequence at a time.
