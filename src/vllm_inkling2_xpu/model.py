@@ -30,6 +30,7 @@ from vllm.model_executor.models.interfaces import (
     SupportsEagle3,
     SupportsMultiModal,
 )
+from vllm.model_executor.models.utils import _merge_multimodal_embeddings
 from vllm.models.inkling.nvidia.sconv_swa_attn import InklingConvState
 from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.sequence import IntermediateTensors
@@ -48,6 +49,7 @@ from .ops.attention import compute_log_scaling_tau
 from .ops.attn_res import attn_res
 from .ops.norm import rms_norm
 from .sconv import ATTN_STREAM, MLP_STREAM, Inkling2ShortConv
+from .vision import Inkling2VisionEncoder
 
 
 class Inkling2RMSNorm(nn.Module):
@@ -349,14 +351,15 @@ class Inkling2ForConditionalGeneration(nn.Module, SupportsMultiModal, SupportsEa
                 "expert parallelism disabled"
             )
         mm_config = vllm_config.model_config.multimodal_config
-        if (
-            config.vision_config is not None
-            and mm_config is not None
-            and mm_config.get_limit_per_prompt("image")
-        ):
-            raise NotImplementedError("Inkling2 XPU requires --language-model-only")
         self.config = config
         self.text_config = text_config = config.text_config
+        self.visual = (
+            Inkling2VisionEncoder(config.vision_config, text_config.hidden_size)
+            if config.vision_config is not None
+            and mm_config is not None
+            and mm_config.get_limit_per_prompt("image")
+            else None
+        )
         model_cls = Inkling2Model
         if text_config.loop_config is not None:
             from .loop import Inkling2LoopModel
@@ -385,9 +388,15 @@ class Inkling2ForConditionalGeneration(nn.Module, SupportsMultiModal, SupportsEa
         raise ValueError("Only image modality is supported")
 
     def embed_multimodal(self, **kwargs: object) -> MultiModalEmbeddings:
-        if kwargs:
-            raise NotImplementedError("Inkling2 XPU does not support image inputs")
-        return ()
+        patches = kwargs.get("vision_pixels")
+        grid_thw = kwargs.get("vision_grid_thw")
+        if patches is None or grid_thw is None:
+            return ()
+        assert isinstance(patches, torch.Tensor)
+        assert isinstance(grid_thw, torch.Tensor)
+        assert self.visual is not None
+        embeds = self.visual(patches, grid_thw)
+        return embeds.split(grid_thw.prod(-1).tolist())
 
     def embed_input_ids(
         self,
@@ -396,9 +405,15 @@ class Inkling2ForConditionalGeneration(nn.Module, SupportsMultiModal, SupportsEa
         *,
         is_multimodal: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        if multimodal_embeddings:
-            raise NotImplementedError("Inkling2 XPU does not support image inputs")
-        return self.model.embed_input_ids(input_ids)
+        inputs_embeds = self.model.embed_input_ids(input_ids)
+        if not multimodal_embeddings:
+            return inputs_embeds
+        assert is_multimodal is not None
+        return _merge_multimodal_embeddings(
+            inputs_embeds=inputs_embeds,
+            multimodal_embeddings=multimodal_embeddings,
+            is_multimodal=is_multimodal,
+        )
 
     def forward(
         self,
@@ -427,8 +442,11 @@ class Inkling2ForConditionalGeneration(nn.Module, SupportsMultiModal, SupportsEa
         }
         loaded: set[str] = set()
         loaded_shards: set[tuple[str, int]] = set()
+        visual_weights: list[tuple[str, torch.Tensor]] = []
         for name, weight in weights:
             if name.startswith("model.visual."):
+                if self.visual is not None:
+                    visual_weights.append((name.removeprefix("model.visual."), weight))
                 continue
             for old, new in self._renames:
                 name = name.replace(old, new)
@@ -470,6 +488,8 @@ class Inkling2ForConditionalGeneration(nn.Module, SupportsMultiModal, SupportsEa
             fused = next(f for f in num_shards if f in name)
             if count == num_shards[fused]:
                 loaded.add(name)
+        if self.visual is not None:
+            loaded |= {f"visual.{n}" for n in self.visual.load_weights(visual_weights)}
         if missing := params.keys() - loaded:
             raise ValueError(f"Missing checkpoint tensors: {sorted(missing)}")
         return loaded
