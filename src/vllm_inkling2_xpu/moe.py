@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Inkling2 packed NVFP4 and MXFP8 experts for Intel XPU."""
 
+import os
 from collections.abc import Callable, Sequence
 from typing import Literal
 
@@ -92,6 +93,27 @@ class Inkling2Experts(nn.Module):
         param.data.copy_(loaded)
 
     def process_weights_after_loading(self) -> None:
+        # Opt-in CUTLASS Xe2 grouped GEMM (scripts/build-cutlass-xe2.sh): it reads the
+        # checkpoint NVFP4 layout and [E, K, N] MXFP8 weights instead of our repacks.
+        self.cutlass = os.environ.get("INK2_CUTLASS_MOE", "0") == "1"
+        if self.cutlass:
+            if is_weights_pre_processed():
+                raise NotImplementedError(
+                    "INK2_CUTLASS_MOE=1 needs checkpoint-format expert weights"
+                )
+            from .ops.moe_cutlass import cutlass_experts
+
+            self._cutlass_experts = cutlass_experts
+            self._outer = {}
+            for name in ("w13", "w2"):
+                amax, denominator = self.scales(name)
+                if self.nvfp4:
+                    self._outer[name] = (amax / denominator).float().contiguous()
+                else:
+                    weight = getattr(self, f"{name}_weight")
+                    weight.data = weight.data.transpose(-1, -2).contiguous()
+                    self._outer[name] = None
+            return
         # Kernel-format reloads already hold split-half weights.
         if self.nvfp4 and not is_weights_pre_processed():
             repack_nvfp4_split_half(self.w13_weight)
@@ -120,6 +142,23 @@ class Inkling2Experts(nn.Module):
     ) -> torch.Tensor:
         """Run packed projections and combine the selected experts' outputs."""
         ids, weights, is_padding = routing
+        if getattr(self, "cutlass", False):
+            return self._cutlass_experts(
+                x,
+                ids,
+                weights,
+                is_padding,
+                self.w13_weight,
+                self.w13_weight_scale,
+                self._outer["w13"],
+                self.w2_weight,
+                self.w2_weight_scale,
+                self._outer["w2"],
+                self.nvfp4,
+                self.num_experts,
+                self.gate_cap,
+                self.up_cap,
+            )
         return packed_experts(
             x,
             ids,

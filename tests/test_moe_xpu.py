@@ -146,6 +146,61 @@ def test_xpu_packed_experts(projections, tokens):
         assert torch.equal(padded, torch.zeros_like(out))
 
 
+@pytest.fixture(scope="module", params=["nvfp4", "mxfp8"])
+def cutlass_projections(request):
+    """The `projections` weights in the layouts INK2_CUTLASS_MOE=1 uses: checkpoint
+    NVFP4 bytes (no split-half repack) and [E, K, N] MXFP8."""
+    pytest.importorskip(
+        "vllm_inkling2_xpu.ops._inkling_nvfp4_xe2",
+        reason="build with scripts/build-cutlass-xe2.sh",
+    )
+    rng = torch.Generator().manual_seed(291)
+    active_ids = torch.tensor([0, 1, 7, 11, 13, 23, 39, 57, 73, 88, 104, 127])
+    w13, ref13 = _projection(2 * INTERMEDIATE, HIDDEN, active_ids, request.param, rng)
+    w2, ref2 = _projection(HIDDEN, INTERMEDIATE, active_ids, request.param, rng)
+    nvfp4 = request.param == "nvfp4"
+
+    def layout(p):
+        weight, scale, amax, denominator = p
+        if nvfp4:
+            return weight, scale, (amax / denominator).float().contiguous()
+        # The model holds MXFP8 experts as float8_e4m3fn; the vendor GEMM picks its
+        # kernel from that dtype.
+        weight = weight.view(torch.float8_e4m3fn).transpose(-1, -2).contiguous()
+        return weight, scale, None
+
+    return active_ids, layout(w13), layout(w2), ref13, ref2, nvfp4
+
+
+@pytest.mark.parametrize("tokens", [1, 2, 4, 5, 8, 64, 300])
+@torch.inference_mode()
+def test_xpu_cutlass_experts(cutlass_projections, tokens):
+    from vllm_inkling2_xpu.ops.moe_cutlass import cutlass_experts
+
+    active_ids, w13, w2, ref13, ref2, nvfp4 = cutlass_projections
+    rng = torch.Generator().manual_seed(1801 + tokens)
+    x = torch.randn(tokens, HIDDEN, generator=rng).bfloat16()
+    ids = torch.rand((tokens, active_ids.numel()), generator=rng).argsort()[:, :TOPK]
+    weights = torch.randn(tokens, TOPK, generator=rng).softmax(-1) * 8
+    padding = torch.arange(tokens) % 7 == 3
+    x[padding] = torch.nan
+    expected, magnitude = _dense_reference(x, ids, weights, padding, ref13, ref2)
+    args = (x.xpu(), active_ids[ids].int().xpu(), weights.xpu())
+    mask = padding.xpu() if tokens > 1 else None
+
+    def run():
+        return cutlass_experts(
+            *args, mask, *w13, *w2, nvfp4, EXPERTS, GATE_CAP, UP_CAP
+        )
+
+    out = run()
+    error = (out.cpu().double() - expected.double()).abs()
+    eps = torch.finfo(torch.bfloat16).eps
+    assert (error <= 2 * eps * magnitude).all()
+    assert (out.cpu()[padding] == 0).all()
+    assert torch.equal(out.view(torch.int16), run().view(torch.int16))
+
+
 @torch.inference_mode()
 def test_xpu_nvfp4_repack_skipped_for_processed_weights(dist_init):
     """Kernel-format reloads restore split-half weights; repacking again would

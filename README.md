@@ -18,7 +18,7 @@ Not affiliated with vLLM, Intel, or Thinking Machines.
 |---|---|
 | GPU | 1x Intel Arc Pro B70 (32 GB, Xe2 / Battlemage) |
 | Host | Ubuntu 26.04.1, kernel 7.0.0-34, `xe` driver |
-| vLLM | main at or after `c32251b5d1` (Inkling 2 Mini, #69028), XPU Docker image |
+| vLLM | main at or after `c32251b5d1` (Inkling 2 Mini, #69028), XPU Docker image; also `3146a9df41` + #69186 from source (2026-11-23) |
 | PyTorch / Triton | 2.15.0+xpu / 3.9.0+xpu (pinned by vLLM's `requirements/xpu.txt`) |
 | Model | `thinkingmachines/Inkling-2-Mini` (Apache-2.0, ~20 GB download) |
 
@@ -134,15 +134,20 @@ Development-tier measurements on one Arc Pro B70, single stream, greedy, 256
 output tokens, 6 coding and reasoning chat prompts. These are not standardized
 benchmark results; raw results and the script are in [`results/`](results/).
 
-| | Decode tok/s (median) | DSpark acceptance length |
-|---|---:|---:|
-| No speculation, vLLM main + #69186 | 57.2 | — |
-| DSpark k=7, vLLM main + #69186 | 75.9 | 2.99 |
+Measured 2026-11-23 on vLLM main `3146a9df41` + #69186, with `--max-model-len 32768 --max-num-batched-tokens 2048 --gpu-memory-utilization 0.92` and a 275 W cap. Throughput figures are decode tok/s (median); acceptance length is shown in parentheses where DSpark is on.
 
-Prefill is about 3,250 tok/s for a 2,000-token prompt. Without #69186, decode is
-about 7.5 ms/token slower. DSpark gains depend on the workload: on short chat
-prompts with reasoning disabled, acceptance length was 2.02 and DSpark was slower
-than no speculation. The first requests after startup are slower while Triton
+| | Default kernels | `INK2_CUTLASS_MOE=1` (see below) |
+|---|---:|---:|
+| No speculation | **57.6** | 56.0 |
+| No speculation, +6K / +30K tokens of context | **54.9 / 51.3** | 53.4 / 50.0 |
+| DSpark k=7 | 83.0 (2.99) | **99.0 (3.16)** |
+| DSpark k=7, +6K / +30K context | 82.2 (3.22) / 76.4 (3.11) | **103.7 (3.13) / 100.7 (3.57)** |
+| 8K cold prefill, tok/s | 3,615 | **4,085** |
+| Top-1 vs CPU fp32 (4,174 positions; CPU bf16 floor 0.9938) | 0.9938 | 0.9938 |
+
+Raw summaries and launch lines are in [`results/decode/cutlass-xe2-20261123/`](results/decode/cutlass-xe2-20261123/). Without #69186, decode is about 7.5 ms/token slower.
+
+DSpark gains depend on the workload. On short chat prompts with reasoning disabled, acceptance length was 2.02 and DSpark was slower than no speculation. The first requests after startup are slower while Triton
 kernels compile.
 
 With DSpark enabled, greedy output can differ from greedy output without it.
@@ -150,6 +155,30 @@ Verification runs several tokens through the batched expert kernel instead of th
 single-token kernel, so rounding differs and near-tied tokens can flip; in the
 cases we checked, the top-two log-probabilities at the first divergence were 0.025
 to 0.068 apart.
+
+### Optional: CUTLASS Xe2 expert kernel (`INK2_CUTLASS_MOE=1`)
+
+The routed experts can run on a SYCL CUTLASS grouped GEMM instead of the Triton kernels. It reads the checkpoint's NVFP4 bytes directly for layers 0–19 and uses the vllm-xpu-kernels MXFP8 grouped GEMM for layers 20–23.
+
+**When to use it:**
+
+- It gives about 20–30% faster DSpark decode and 13% faster prefill.
+- Non-speculative decode is about 3% slower, so leave it off for servers that don't use DSpark.
+- Quality: no measured loss (table above).
+
+**Credit and license:** the kernel and its dispatcher are by [SergiioB](https://github.com/SergiioB/intel-arc-pro-b70-inference-cookbook), vendored under the MIT license (see [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)).
+
+**Build.** It is a compiled extension, built once into the installed plugin. You need Intel oneAPI `icpx` (tested 2026.1.1), `ocloc` from the [compute-runtime release](https://github.com/intel/compute-runtime/releases) matching your driver, and header checkouts of [sycl-tla](https://github.com/intel/sycl-tla) `7b56b936` and [vllm-xpu-kernels](https://github.com/vllm-project/vllm-xpu-kernels) `e9b6e4b2`:
+
+```bash
+source /opt/intel/oneapi/setvars.sh
+PYTHON=/path/to/venv/bin/python SYCL_TLA_DIR=/path/to/sycl-tla \
+  VLLM_XPU_KERNELS_DIR=/path/to/vllm-xpu-kernels scripts/build-cutlass-xe2.sh
+```
+
+**Serve.** Start `vllm serve` with `INK2_CUTLASS_MOE=1` in the environment, from a shell where oneAPI's `setvars.sh` has **not** been sourced. Its runtime libraries would shadow the ones bundled with PyTorch.
+
+**Not compatible with:** kernel-format weight reloads.
 
 ## Numerical parity
 
@@ -197,6 +226,8 @@ From a vLLM source checkout, after installing the plugin, on an XPU machine:
 PYTHONPATH="$PWD:/path/to/vllm-inkling2-xpu/tests" \
   pytest -q -p tests.conftest /path/to/vllm-inkling2-xpu/tests
 ```
+
+`test_xpu_cutlass_experts` runs only after `scripts/build-cutlass-xe2.sh`, and otherwise skips.
 
 ## Compatibility
 
